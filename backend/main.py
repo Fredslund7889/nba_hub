@@ -1,3 +1,7 @@
+from datetime import date
+from datetime import datetime, timedelta
+from services import sync_nba_games # Importer vores nye sync-funktion
+from services import get_game_rosters
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
@@ -63,6 +67,20 @@ def get_finished_games():
     conn.close()
     return {"finished_games": games}
 
+# Global variabel til at holde styr på seneste sync-tidspunkt i hukommelsen
+last_sync_time = datetime.now() - timedelta(hours=1)
+
+# --- Endpoint til "Opdater data"-knap ---
+@app.post("/games/refresh")
+def refresh_games():
+    global last_sync_time
+    success = sync_nba_games()
+    if not success:
+        raise HTTPException(status_code=500, detail="Kunne ikke hente nye data fra BallDontLie API.")
+    
+    last_sync_time = datetime.now()
+    return {"message": "Kampe blev opdateret succesfuldt!"}
+
 # --- New User Endpoints ---
 @app.post("/users", status_code=201)
 def create_user(user: UserCreate):
@@ -88,11 +106,25 @@ def create_user(user: UserCreate):
 # --- New Prediction Endpoints ---
 @app.post("/predictions")
 def make_prediction(pred: PredictionCreate):
+    global last_sync_time
+    
+    # Hvis data er ældre end 5 minutter, og en bruger laver en prediction: refresh automatisk!
+    if datetime.now() - last_sync_time > timedelta(minutes=5):
+        try:
+            if sync_nba_games():
+                last_sync_time = datetime.now()
+        except Exception as e:
+            # Hvis API'et driller, fortsætter vi blot med eksisterende DB-data
+            print(f"Automatisk sync fejlede: {e}")
+
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # Tjek om kampen findes og ikke er afsluttet endnu
-    cur.execute("SELECT status, home_team_id, away_team_id FROM games WHERE id = %s;", (pred.game_id,))
+    cur.execute("""
+        SELECT status, game_date, home_team_id, away_team_id 
+        FROM games 
+        WHERE id = %s;
+    """, (pred.game_id,))
     game = cur.fetchone()
     
     if not game:
@@ -100,17 +132,32 @@ def make_prediction(pred: PredictionCreate):
         conn.close()
         raise HTTPException(status_code=404, detail="Kamp ikke fundet.")
         
-    if game['status'] == 'Final':
+    # 1. Tjek om kampen er markeret som Final eller har ændret status fra 'Scheduled'
+    if game['status'] == 'Final' or game['status'] != 'Scheduled':
         cur.close()
         conn.close()
-        raise HTTPException(status_code=400, detail="Kampen er allerede afsluttet. Du kan ikke afgive gæt.")
+        raise HTTPException(
+            status_code=400, 
+            detail="Kampen er allerede afsluttet eller i gang. Forudsigelser er låst."
+        )
 
+    # 2. Tjek om kampdatoen er en tidligere dato end i dag
+    game_date_only = game['game_date'].date() if hasattr(game['game_date'], 'date') else game['game_date']
+    if game_date_only < date.today():
+        cur.close()
+        conn.close()
+        raise HTTPException(
+            status_code=400, 
+            detail="Datoen for denne kamp er passeret. Forudsigelser er låst."
+        )
+
+    # 3. Tjek om det valgte hold spiller i kampen
     if pred.predicted_winner_id not in [game['home_team_id'], game['away_team_id']]:
         cur.close()
         conn.close()
         raise HTTPException(status_code=400, detail="Det valgte hold spiller ikke i denne kamp.")
 
-    # Indsæt eller opdater eksisterende gæt (UPSERT)
+    # Indsæt eller opdater gæt (UPSERT)
     cur.execute("""
         INSERT INTO predictions (user_id, game_id, predicted_winner_id)
         VALUES (%s, %s, %s)
@@ -124,7 +171,7 @@ def make_prediction(pred: PredictionCreate):
     cur.close()
     conn.close()
     
-    return {"message": "Prediction gemt!", "prediction": saved_prediction}
+    return {"message": "Prediction gemt succesfuldt!", "prediction": saved_prediction}
 
 @app.get("/users/{user_id}/predictions")
 def get_user_predictions(user_id: int):
@@ -161,3 +208,76 @@ def get_user_predictions(user_id: int):
     conn.close()
     
     return {"user_id": user_id, "predictions": predictions}
+
+@app.get("/users/{user_id}/my-predictions")
+def get_user_my_predictions(user_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # 1. Aktuelle/kommende gæt (hvor kampen ikke er afsluttet endnu)
+    cur.execute("""
+        SELECT 
+            p.id AS prediction_id,
+            g.id AS game_id,
+            g.game_date,
+            g.status AS game_status,
+            ht.abbreviation AS home_team,
+            at.abbreviation AS away_team,
+            pt.full_name AS predicted_winner,
+            pt.id AS predicted_winner_id
+        FROM predictions p
+        JOIN games g ON p.game_id = g.id
+        JOIN teams ht ON g.home_team_id = ht.id
+        JOIN teams at ON g.away_team_id = at.id
+        JOIN teams pt ON p.predicted_winner_id = pt.id
+        WHERE p.user_id = %s AND g.status != 'Final'
+        ORDER BY g.game_date ASC;
+    """, (user_id,))
+    active_predictions = cur.fetchall()
+    
+    # 2. Historik over afsluttede kampe (inkl. kampe der IKKE er gættet på)
+    cur.execute("""
+        SELECT 
+            g.id AS game_id,
+            g.game_date,
+            g.status AS game_status,
+            g.home_score,
+            g.away_score,
+            ht.abbreviation AS home_team,
+            at.abbreviation AS away_team,
+            CASE 
+                WHEN g.home_score > g.away_score THEN ht.full_name
+                ELSE at.full_name
+            END AS actual_winner,
+            pt.full_name AS predicted_winner,
+            CASE 
+                WHEN p.id IS NULL THEN 'No Prediction'
+                WHEN (g.home_score > g.away_score AND p.predicted_winner_id = g.home_team_id) OR
+                     (g.away_score > g.home_score AND p.predicted_winner_id = g.away_team_id) THEN 'Correct'
+                ELSE 'Incorrect'
+            END AS result
+        FROM games g
+        JOIN teams ht ON g.home_team_id = ht.id
+        JOIN teams at ON g.away_team_id = at.id
+        LEFT JOIN predictions p ON g.id = p.game_id AND p.user_id = %s
+        LEFT JOIN teams pt ON p.predicted_winner_id = pt.id
+        WHERE g.status = 'Final'
+        ORDER BY g.game_date DESC;
+    """, (user_id,))
+    history = cur.fetchall()
+    
+    cur.close()
+    conn.close()
+    
+    return {
+        "user_id": user_id,
+        "active_predictions": active_predictions,
+        "history": history
+    }
+
+@app.get("/games/{game_id}/rosters")
+def get_rosters(game_id: int):
+    rosters = get_game_rosters(game_id)
+    if rosters is None:
+        raise HTTPException(status_code=404, detail="Kampen blev ikke fundet.")
+    return rosters
