@@ -6,8 +6,42 @@ from datetime import date, timedelta
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://nba_user:secret_password@db:5432/nba_db")
 API_KEY = os.getenv("BALLDONTLIE_API_KEY")
 
+# Mapping fra holdets abbreviation til Bell Media / TSN competitor ID
+BELL_MEDIA_TEAM_IDS = {
+    "ATL": 1,   # Atlanta Hawks
+    "BOS": 2,   # Boston Celtics
+    "BKN": 17,   # Brooklyn Nets
+    "CHA": 5312,   # Charlotte Hornets
+    "CHI": 4,   # Chicago Bulls
+    "CLE": 5,   # Cleveland Cavaliers
+    "DAL": 6,   # Dallas Mavericks
+    "DEN": 7,   # Denver Nuggets
+    "DET": 8,   # Detroit Pistons
+    "GSW": 9,  # Golden State Warriors
+    "HOU": 10,  # Houston Rockets
+    "IND": 11,  # Indiana Pacers
+    "LAC": 12,  # LA Clippers
+    "LAL": 13,  # Los Angeles Lakers
+    "MEM": 29,  # Memphis Grizzlies
+    "MIA": 14,  # Miami Heat
+    "MIL": 15,  # Milwaukee Bucks
+    "MIN": 16,  # Minnesota Timberwolves
+    "NOP": 3,  # New Orleans Pelicans
+    "NYK": 18,  # New York Knicks
+    "OKC": 25,  # Oklahoma City Thunder
+    "ORL": 19,  # Orlando Magic
+    "PHI": 20,  # Philadelphia 76ers
+    "PHX": 21,  # Phoenix Suns
+    "POR": 22,  # Portland Trail Blazers
+    "SAC": 23,  # Sacramento Kings
+    "SAS": 24,  # San Antonio Spurs
+    "TOR": 28,  # Toronto Raptors
+    "UTA": 26,  # Utah Jazz
+    "WAS": 27,  # Washington Wizards
+}
+
 def sync_nba_games():
-    """Henter kampe fra BallDontLie for en 3-dages rullende vindue og opdaterer PostgreSQL."""
+    """Henter kampe fra BallDontLie for et 3-dages rullende vindue og opdaterer PostgreSQL."""
     if not API_KEY:
         print("Advarsel: BALLDONTLIE_API_KEY er ikke sat.")
         return False
@@ -40,14 +74,13 @@ def sync_nba_games():
     
     synced_count = 0
     for g in data:
-        # Brug .get() for at undgå KeyError hvis et felt mangler i et API-svar
         game_id = g.get("id")
         game_date = g.get("date")
         home_team = g.get("home_team")
         away_team = g.get("away_team")
         
         if not home_team or not away_team:
-            continue # Spring over hvis hold-data mangler
+            continue
             
         home_team_id = home_team.get("id")
         away_team_id = away_team.get("id")
@@ -55,7 +88,6 @@ def sync_nba_games():
         away_score = g.get("away_score", 0) or 0
         status = g.get("status", "Scheduled")
         
-        # Indsæt eller opdater kampen (UPSERT)
         cur.execute("""
             INSERT INTO games (id, game_date, home_team_id, away_team_id, home_score, away_score, status)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -74,53 +106,90 @@ def sync_nba_games():
     print(f"Synkroniseret {synced_count} kampe succesfuldt.")
     return True
 
-def get_game_rosters(game_id: int):
-    """Henter hold og spillere for en specifik kamp via vores egen database og BallDontLie API (kun spillere med trøjenummer)."""
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    
-    # Hent hold-ID'erne for den valgte kamp fra vores database
-    cur.execute("""
-        SELECT home_team_id, away_team_id 
-        FROM games 
-        WHERE id = %s;
-    """, (game_id,))
-    game_teams = cur.fetchone()
-    cur.close()
-    conn.close()
-    
-    if not game_teams:
-        return None
-        
-    home_team_id, away_team_id = game_teams
-    
-    # Hent spillere fra BallDontLie API for begge hold
-    headers = {"Authorization": API_KEY}
-    url = "https://api.balldontlie.io/v1/players"
-    
-    def fetch_players_for_team(team_id):
-        params = {"team_ids[]": [team_id], "per_page": 100}
-        resp = requests.get(url, headers=headers, params=params)
-        if resp.status_code == 200:
-            return resp.json().get("data", [])
+def fetch_tsn_roster(team_abbrev: str):
+    """Henter den aktuelle trup via Bell Media / TSN API."""
+    tsn_id = BELL_MEDIA_TEAM_IDS.get(team_abbrev)
+    if not tsn_id:
+        print(f"[TSN API Warning] Ukendt holdforkortelse: {team_abbrev}", flush=True)
         return []
 
-    home_players = fetch_players_for_team(home_team_id)
-    away_players = fetch_players_for_team(away_team_id)
-    
-    # Filtrer og formatér dataen (fravælg spillere uden trøjenummer)
-    def format_players(players):
-        filtered_players = [p for p in players if p.get("jersey_number") not in (None, "")]
-        return [{
-            "id": p.get("id"),
-            "first_name": p.get("first_name"),
-            "last_name": p.get("last_name"),
-            "position": p.get("position"),
-            "jersey_number": p.get("jersey_number")
-        } for p in filtered_players]
-
-    return {
-        "game_id": game_id,
-        "home_team_players": format_players(home_players),
-        "away_team_players": format_players(away_players)
+    url = f"https://next-gen.sports.bellmedia.ca/v2/competitor/basketball/nba/{tsn_id}/roster?brand=tsn&lang=en"
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
+        "Referer": "https://www.tsn.ca/"
     }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code != 200:
+            print(f"[TSN API Error] Status {resp.status_code} for {team_abbrev}", flush=True)
+            return []
+
+        data = resp.json()
+
+        # Responsen er en liste, men vær defensiv hvis den ændrer sig til et objekt
+        if isinstance(data, list):
+            players_data = data
+        else:
+            players_data = data.get("players") or data.get("roster") or []
+
+        formatted_players = []
+        for p in players_data:
+            jersey = p.get("number")
+            if jersey is None:
+                continue
+
+            formatted_players.append({
+                "id": p.get("playerId"),
+                "first_name": p.get("firstName") or "",
+                "last_name": p.get("lastName") or "",
+                "position": p.get("positionShort") or p.get("position"),
+                "jersey_number": str(jersey),
+                "photo_url": None,  # Ikke i TSN roster-payload
+            })
+        return formatted_players
+
+    except Exception as e:
+        print(f"[TSN API Exception] Fejl ved hentning af {team_abbrev}: {e}", flush=True)
+
+    return []
+
+def get_game_rosters(game_id: int):
+    """Henter hold og aktive trupper for en kamp via databasen og TSN API."""
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        
+        # Henter holdenes forkortelser (f.eks. 'ATL', 'NYK') via JOIN
+        cur.execute("""
+            SELECT 
+                h.abbreviation AS home_abbrev, 
+                a.abbreviation AS away_abbrev
+            FROM games g
+            JOIN teams h ON g.home_team_id = h.id
+            JOIN teams a ON g.away_team_id = a.id
+            WHERE g.id = %s;
+        """, (game_id,))
+        
+        game_teams = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if not game_teams:
+            return None
+            
+        home_abbrev, away_abbrev = game_teams
+
+        return {
+            "game_id": game_id,
+            "home_team_players": fetch_tsn_roster(home_abbrev),
+            "away_team_players": fetch_tsn_roster(away_abbrev)
+        }
+    except Exception as e:
+        print(f"[Backend Error] Exception i get_game_rosters: {e}")
+        return {
+            "game_id": game_id,
+            "home_team_players": [],
+            "away_team_players": []
+        }

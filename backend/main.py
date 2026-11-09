@@ -3,12 +3,20 @@ from datetime import datetime, timedelta
 from services import sync_nba_games # Importer vores nye sync-funktion
 from services import get_game_rosters
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 app = FastAPI(title="NBA Pick 'em API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],  # Tillad din fremtidige Vue-dev-server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://nba_user:secret_password@localhost:5432/nba_db")
 
